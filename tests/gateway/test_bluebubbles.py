@@ -708,3 +708,37 @@ class TestBlueBubblesDuplicateInbound:
         await asyncio.sleep(0)
         assert handled == ["msg-a", "msg-b"]
 
+    @pytest.mark.asyncio
+    async def test_group_event_then_bare_sender_does_not_dm_the_sender(self, monkeypatch):
+        """Group new-message + updated-message with only the sender handle must not 1:1 the sender."""
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False, require_mention=False)
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append((event.source.chat_id, event.source.chat_type))
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "new-message",
+            "data": {
+                "guid": "msg-group-1",
+                "text": "yo nick meet my robot",
+                "handle": {"address": "+15555550100"},
+                "isFromMe": False,
+                "isGroup": True,
+                "chats": [{"guid": "any;+;c7415466368c4ef8aaae3d25a7b9c2a7"}],
+            },
+        }))
+        await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "updated-message",
+            "data": {
+                "guid": "msg-group-1",
+                "text": "yo nick meet my robot",
+                "handle": {"address": "+15555550100"},
+                "isFromMe": False,
+                "chatIdentifier": "+15555550100",
+            },
+        }))
+        await asyncio.sleep(0)
+        assert handled == [("any;+;c7415466368c4ef8aaae3d25a7b9c2a7", "group")]
+
