@@ -742,3 +742,89 @@ class TestBlueBubblesDuplicateInbound:
         await asyncio.sleep(0)
         assert handled == [("any;+;c7415466368c4ef8aaae3d25a7b9c2a7", "group")]
 
+    @pytest.mark.asyncio
+    async def test_sparse_update_then_group_new_message_keeps_the_group(self, monkeypatch):
+        """If a bare-handle updated-message arrives first, do not lock a DM and drop the group."""
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False, require_mention=False)
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append((event.source.chat_id, event.source.chat_type))
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "updated-message",
+            "data": {
+                "guid": "msg-group-2",
+                "text": "yo nick meet my robot",
+                "handle": {"address": "+15555550100"},
+                "isFromMe": False,
+                "chatIdentifier": "+15555550100",
+            },
+        }))
+        await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "new-message",
+            "data": {
+                "guid": "msg-group-2",
+                "text": "yo nick meet my robot",
+                "handle": {"address": "+15555550100"},
+                "isFromMe": False,
+                "isGroup": True,
+                "chats": [{"guid": "any;+;c7415466368c4ef8aaae3d25a7b9c2a7"}],
+            },
+        }))
+        await asyncio.sleep(0)
+        assert handled == [("any;+;c7415466368c4ef8aaae3d25a7b9c2a7", "group")]
+
+
+class TestBlueBubblesStaleWebhookCleanup:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("order", ["stale_first", "compliant_first"])
+    async def test_stale_same_url_registrations_are_removed(self, monkeypatch, order):
+        adapter = _make_adapter(monkeypatch)
+        url = adapter._webhook_register_url
+        stale = {"id": "stale", "url": url, "events": ["new-message", "updated-message"]}
+        good = {"id": "good", "url": url, "events": ["new-message"]}
+        listed = [stale, good] if order == "stale_first" else [good, stale]
+        deleted = []
+
+        async def fake_find(_url):
+            return list(listed)
+
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+        async def fake_delete(_url):
+            deleted.append(_url)
+            return _Resp()
+
+        adapter.client = AsyncMock()
+        adapter.client.delete = fake_delete
+        monkeypatch.setattr(adapter, "_find_registered_webhooks", fake_find)
+        posted = []
+
+        async def fake_post(path, payload):
+            posted.append(payload)
+            return {"status": 200}
+
+        monkeypatch.setattr(adapter, "_api_post", fake_post)
+        assert await adapter._register_webhook() is True
+        assert any("stale" in u for u in deleted)
+        assert posted == []
+
+    @pytest.mark.asyncio
+    async def test_register_posts_new_message_only(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        adapter.client = AsyncMock()
+        monkeypatch.setattr(adapter, "_find_registered_webhooks", AsyncMock(return_value=[]))
+        posted = []
+
+        async def fake_post(path, payload):
+            posted.append((path, payload))
+            return {"status": 200}
+
+        monkeypatch.setattr(adapter, "_api_post", fake_post)
+        assert await adapter._register_webhook() is True
+        assert posted == [("/api/v1/webhook", {"url": adapter._webhook_register_url, "events": ["new-message"]})]
+

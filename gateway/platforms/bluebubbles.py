@@ -24,7 +24,7 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.event import MessageEvent, MessageType
 from .media_cache import ext_for_mime
-from gateway.platforms.helpers import compile_mention_patterns, strip_markdown
+from gateway.platforms.helpers import MessageDeduplicator, compile_mention_patterns, strip_markdown
 from utils import TRUTHY_STRINGS
 
 # Historical BlueBubbles mime→ext maps, preserved verbatim as overrides for the shared dispatch in
@@ -55,7 +55,8 @@ DEFAULT_MENTION_PATTERNS = [r"(?<![\w@])@?hermes\s+agent\b[,:\-]?", r"(?<![\w@])
 
 # Tapback associatedMessageType codes: 2000-2005 added, 3000-3005 removed (love, like, dislike, ...).
 _TAPBACK_CODES = {*range(2000, 2006), *range(3000, 3006)}
-_MESSAGE_EVENTS = {"new-message", "message", "updated-message"}  # webhook event types carrying user messages
+_MESSAGE_EVENTS = {"new-message", "message"}  # not updated-message: receipts/read-state (#30708)
+_WEBHOOK_EVENTS = ("new-message",)
 
 _PHONE_RE = re.compile(r"\+?\d{7,15}")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
@@ -63,7 +64,6 @@ _PAGINATION_SUFFIX_RE = re.compile(r"\s*\(\d+/\d+\)$")
 _ADDRESS_RE = re.compile(r"^\+\d+")
 
 _GUID_CACHE_SIZE = 500  # LRU cap for resolved chat-GUID lookups
-_SEEN_MESSAGE_IDS = 512  # inbound webhook GUID LRU — new-message + updated-message echo the same iMessage
 _LOCAL_HOSTS = {"0.0.0.0", "127.0.0.1", "localhost", "::"}
 _DM_GUID_SEP = ";-;"  # BlueBubbles 1:1 chat GUIDs: ``any;-;+1555…`` / ``iMessage;-;user@…``
 
@@ -133,7 +133,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
         self._guid_cache: OrderedDict[str, str] = OrderedDict()
-        self._seen_message_ids: OrderedDict[str, None] = OrderedDict()
+        self._inbound_dedup = MessageDeduplicator(max_size=2000, ttl_seconds=300)
 
     # --- API helpers ---
 
@@ -285,17 +285,30 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         return []
 
     async def _register_webhook(self) -> bool:
-        """Register this webhook URL, reusing an existing registration if present (crash resilience —
-        avoids duplicates after an unclean shutdown)."""
+        """Register this webhook for ``new-message`` only. Deletes every same-URL row that still
+        subscribes to ``updated-message`` (or is a duplicate), regardless of list order (#45717)."""
         if not self.client:
             return False
         webhook_url, log_url = self._webhook_register_url, self._webhook_register_url_for_log
-        if await self._find_registered_webhooks(webhook_url):
+        existing = await self._find_registered_webhooks(webhook_url)
+        keep = None
+        desired = set(_WEBHOOK_EVENTS)
+        for wh in existing:
+            events = set(wh.get("events") or [])
+            if keep is None and events == desired and wh.get("id"):
+                keep = wh
+                continue
+            if wh_id := wh.get("id"):
+                try:
+                    (await self.client.delete(self._api_url(f"/api/v1/webhook/{wh_id}"))).raise_for_status()
+                except Exception as exc:
+                    logger.warning("[bluebubbles] failed to delete stale webhook %s: %s", wh_id, exc)
+                    return False
+        if keep:
             logger.info("[bluebubbles] webhook already registered: %s", log_url)
             return True
         try:
-            res = await self._api_post("/api/v1/webhook",
-                                       {"url": webhook_url, "events": ["new-message", "updated-message"]})
+            res = await self._api_post("/api/v1/webhook", {"url": webhook_url, "events": list(_WEBHOOK_EVENTS)})
             status = res.get("status", 0)
             if 200 <= status < 300:
                 logger.info("[bluebubbles] webhook registered with server: %s", log_url)
@@ -581,18 +594,6 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             return chat_guid.split(_DM_GUID_SEP, 1)[-1]
         return chat_guid or chat_identifier or sender
 
-    def _remember_message_id(self, message_id: Optional[str]) -> bool:
-        """True if this message GUID was already dispatched. Records new ids (bounded LRU)."""
-        if not message_id:
-            return False
-        if message_id in self._seen_message_ids:
-            self._seen_message_ids.move_to_end(message_id)
-            return True
-        self._seen_message_ids[message_id] = None
-        while len(self._seen_message_ids) > _SEEN_MESSAGE_IDS:
-            self._seen_message_ids.popitem(last=False)
-        return False
-
     async def _handle_webhook(self, request):
         from aiohttp import web
 
@@ -612,12 +613,8 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         assoc_type = record.get("associatedMessageType")
         if isinstance(assoc_type, int) and assoc_type in _TAPBACK_CODES:  # tapback reactions delivered as messages
             return _ok()
-        # Read/delivered receipts are ``updated-message`` with the original text; they are not new turns.
-        if event_type == "updated-message" and (record.get("dateRead") or record.get("dateDelivered")):
-            return _ok()
         message_id = self._value(record.get("guid"), record.get("messageGuid"), record.get("id"))
-        if message_id and message_id in self._seen_message_ids:
-            self._seen_message_ids.move_to_end(message_id)
+        if message_id and self._inbound_dedup.contains(message_id):
             return _ok()
         text = self._value(record.get("text"), record.get("message"), record.get("body")) or ""
         chat_guid, chat_identifier, sender = self._resolve_chat_and_sender(payload, record)
@@ -637,7 +634,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         session_chat_id = self._canonical_session_chat_id(
             chat_guid, chat_identifier, sender, is_group) or sender
         if message_id:
-            self._remember_message_id(message_id)
+            self._inbound_dedup.is_duplicate(message_id)
         source = self.build_source(chat_id=session_chat_id, chat_name=chat_identifier or sender,
                                    chat_type="group" if is_group else "dm", user_id=sender, user_name=sender,
                                    chat_id_alt=chat_identifier)
