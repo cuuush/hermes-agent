@@ -426,7 +426,7 @@ class TestBlueBubblesWebhookRegistration:
         url = adapter._webhook_register_url
         adapter.client = self._mock_client(
             get_response={"status": 200, "data": [
-                {"id": 7, "url": url, "events": ["new-message"]},
+                {"id": 7, "url": url, "events": ["new-message", "updated-message"]},
             ]},
         )
 
@@ -662,28 +662,38 @@ class TestBlueBubblesDuplicateInbound:
         assert handled == ["+15555550100"]
 
     @pytest.mark.asyncio
-    async def test_receipt_updated_message_is_not_a_turn(self, monkeypatch):
+    async def test_receipt_updated_message_is_not_a_second_turn(self, monkeypatch):
         adapter = _make_adapter(monkeypatch, send_read_receipts=False)
         handled = []
 
         async def fake_handle_message(event):
-            handled.append(event)
+            handled.append(event.message_id)
 
         monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "new-message",
+            "data": {
+                "guid": "msg-receipt-1",
+                "text": "Hi",
+                "handle": {"address": "+155****0100"},
+                "isFromMe": False,
+                "chats": [{"guid": "any;-;+155****0100"}],
+            },
+        }))
         response = await adapter._handle_webhook(_FakeBlueBubblesRequest({
             "type": "updated-message",
             "data": {
                 "guid": "msg-receipt-1",
                 "text": "Hi",
-                "handle": {"address": "+15555550100"},
+                "handle": {"address": "+155****0100"},
                 "isFromMe": False,
                 "dateRead": 1789849814879,
-                "chats": [{"guid": "any;-;+15555550100"}],
+                "chats": [{"guid": "any;-;+155****0100"}],
             },
         }))
         await asyncio.sleep(0)
         assert response.status == 200
-        assert handled == []
+        assert handled == ["msg-receipt-1"]
 
     @pytest.mark.asyncio
     async def test_distinct_message_guids_still_dispatch(self, monkeypatch):
@@ -783,8 +793,8 @@ class TestBlueBubblesStaleWebhookCleanup:
     async def test_stale_same_url_registrations_are_removed(self, monkeypatch, order):
         adapter = _make_adapter(monkeypatch)
         url = adapter._webhook_register_url
-        stale = {"id": "stale", "url": url, "events": ["new-message", "updated-message"]}
-        good = {"id": "good", "url": url, "events": ["new-message"]}
+        stale = {"id": "stale", "url": url, "events": ["new-message"]}
+        good = {"id": "good", "url": url, "events": ["new-message", "updated-message"]}
         listed = [stale, good] if order == "stale_first" else [good, stale]
         deleted = []
 
@@ -814,7 +824,7 @@ class TestBlueBubblesStaleWebhookCleanup:
         assert posted == []
 
     @pytest.mark.asyncio
-    async def test_register_posts_new_message_only(self, monkeypatch):
+    async def test_register_posts_new_and_updated_message(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         adapter.client = AsyncMock()
         monkeypatch.setattr(adapter, "_find_registered_webhooks", AsyncMock(return_value=[]))
@@ -826,5 +836,43 @@ class TestBlueBubblesStaleWebhookCleanup:
 
         monkeypatch.setattr(adapter, "_api_post", fake_post)
         assert await adapter._register_webhook() is True
-        assert posted == [("/api/v1/webhook", {"url": adapter._webhook_register_url, "events": ["new-message"]})]
+        assert posted == [("/api/v1/webhook", {
+            "url": adapter._webhook_register_url,
+            "events": ["new-message", "updated-message"],
+        })]
+
+    @pytest.mark.asyncio
+    async def test_string_message_reaction_stays_in_the_group(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False, require_mention=False)
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append((event.text, event.source.user_name, event.source.chat_type, event.source.chat_id))
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "new-message",
+            "data": {
+                "guid": "msg-react-1",
+                "text": "Loved “Uhhh what model r u ”",
+                "associatedMessageType": "love",
+                "handle": {"address": "+155****0100", "firstName": "Connor"},
+                "isFromMe": False,
+                "isGroup": True,
+                "chats": [{"guid": "any;+;c7415466368c4ef8aaae3d25a7b9c2a7"}],
+            },
+        }))
+        await asyncio.sleep(0)
+        assert handled == [(
+            "Loved “Uhhh what model r u ”",
+            "Connor",
+            "group",
+            "any;+;c7415466368c4ef8aaae3d25a7b9c2a7",
+        )]
+
+    def test_speaker_label_prefers_handle_first_name(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch)
+        assert adapter._speaker_label("+155****0100", {
+            "handle": {"address": "+155****0100", "firstName": "Connor"},
+        }) == "Connor"
 

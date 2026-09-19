@@ -115,6 +115,31 @@ class TestBuildSessionContextPrompt:
         assert "Telegram" in prompt
         assert "Home Chat" in prompt
 
+    def test_bluebubbles_group_prompt_is_a_shared_imessage_room(self):
+        config = GatewayConfig(
+            group_sessions_per_user=True,
+            platforms={
+                Platform.BLUEBUBBLES: PlatformConfig(
+                    enabled=True,
+                    extra={"group_sessions_per_user": False},
+                ),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.BLUEBUBBLES,
+            chat_id="any;+;abc",
+            chat_type="group",
+            user_id="+155****0100",
+            user_name="Connor",
+        )
+        ctx = build_session_context(source, config)
+        assert ctx.shared_multi_user_session is True
+        prompt = build_session_context_prompt(ctx)
+        assert "**Source:** iMessage group chat (BlueBubbles)" in prompt
+        assert "This is an iMessage group chat." in prompt
+        assert "message reaction" in prompt
+        assert "Multi-user session" in prompt
+
 
     def test_discord_prompt_stable_across_message_id(self):
         """The cached system prompt must NOT vary with the triggering message_id.

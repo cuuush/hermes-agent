@@ -55,8 +55,11 @@ DEFAULT_MENTION_PATTERNS = [r"(?<![\w@])@?hermes\s+agent\b[,:\-]?", r"(?<![\w@])
 
 # Tapback associatedMessageType codes: 2000-2005 added, 3000-3005 removed (love, like, dislike, ...).
 _TAPBACK_CODES = {*range(2000, 2006), *range(3000, 3006)}
-_MESSAGE_EVENTS = {"new-message", "message"}  # not updated-message: receipts/read-state (#30708)
-_WEBHOOK_EVENTS = ("new-message",)
+# ``updated-message`` is a real inbound path: BlueBubbles often fires *only* that event for
+# another participant in a group, while the local user's messages still get ``new-message``.
+# Receipts/read-state reuse the same type with a sparse chat id — filter those, don't unsubscribe.
+_MESSAGE_EVENTS = {"new-message", "message", "updated-message"}
+_WEBHOOK_EVENTS = ("new-message", "updated-message")
 
 _PHONE_RE = re.compile(r"\+?\d{7,15}")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
@@ -134,6 +137,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._helper_connected: bool = False
         self._guid_cache: OrderedDict[str, str] = OrderedDict()
         self._inbound_dedup = MessageDeduplicator(max_size=2000, ttl_seconds=300)
+        self._speaker_name_cache: OrderedDict[str, str] = OrderedDict()
 
     # --- API helpers ---
 
@@ -285,8 +289,8 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         return []
 
     async def _register_webhook(self) -> bool:
-        """Register this webhook for ``new-message`` only. Deletes every same-URL row that still
-        subscribes to ``updated-message`` (or is a duplicate), regardless of list order (#45717)."""
+        """Register this webhook for ``new-message`` + ``updated-message``. Deletes every same-URL
+        row whose event set does not match, regardless of list order (#45717)."""
         if not self.client:
             return False
         webhook_url, log_url = self._webhook_register_url, self._webhook_register_url_for_log
@@ -594,6 +598,61 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             return chat_guid.split(_DM_GUID_SEP, 1)[-1]
         return chat_guid or chat_identifier or sender
 
+    @staticmethod
+    def _is_sparse_chat(chat_guid: Optional[str], chat_identifier: Optional[str],
+                        sender: Optional[str], is_group: bool) -> bool:
+        """True when the payload has no real chat GUID — only the sender handle.
+
+        Group ``updated-message`` events often look like a 1:1 with the person who spoke.
+        Dispatching those opens a DM session; GUID-deduping them then drops the later
+        ``new-message`` that *does* have ``any;+;<guid>``.
+        """
+        if is_group:
+            return False
+        if chat_guid and (_DM_GUID_SEP in chat_guid or ";+;" in chat_guid):
+            return False
+        return True
+
+    async def _hydrate_chats(self, message_id: Optional[str]) -> list:
+        """Look up ``chats[]`` for a message GUID when the webhook omitted them."""
+        if not message_id or not self.client:
+            return []
+        with suppress(Exception):
+            data = (await self._api_get(f"/api/v1/message/{quote(message_id, safe='')}")).get("data")
+            if isinstance(data, dict):
+                chats = data.get("chats") or []
+                if isinstance(chats, list):
+                    return [c for c in chats if isinstance(c, dict)]
+        return []
+
+    def _speaker_label(self, address: Optional[str], record: Optional[Dict[str, Any]] = None) -> str:
+        """Human name for shared-session [sender] prefixes. Cached. Never invent a name from digits."""
+        addr = (address or "").strip()
+        if not addr:
+            return "someone"
+        if addr in self._speaker_name_cache:
+            return self._speaker_name_cache[addr]
+        name = ""
+        handle = (record or {}).get("handle") if record else None
+        if isinstance(handle, dict):
+            name = str(handle.get("firstName") or handle.get("displayName") or handle.get("name") or "").strip()
+        if not name or name == addr:
+            with suppress(Exception):
+                from gateway.pairing import PairingStore
+                for user in PairingStore().list_approved("bluebubbles"):
+                    if str(user.get("user_id") or "") != addr:
+                        continue
+                    candidate = str(user.get("user_name") or "").strip()
+                    if candidate and candidate != addr and not candidate.startswith("+"):
+                        name = candidate
+                    break
+        if not name or name == addr or name.startswith("+"):
+            name = addr
+        if len(self._speaker_name_cache) > 200:
+            self._speaker_name_cache.popitem(last=False)
+        self._speaker_name_cache[addr] = name
+        return name
+
     async def _handle_webhook(self, request):
         from aiohttp import web
 
@@ -611,7 +670,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if record.get("isFromMe") or record.get("fromMe") or record.get("is_from_me"):
             return _ok()
         assoc_type = record.get("associatedMessageType")
-        if isinstance(assoc_type, int) and assoc_type in _TAPBACK_CODES:  # tapback reactions delivered as messages
+        if isinstance(assoc_type, int) and assoc_type in _TAPBACK_CODES:  # integer message-reaction codes
             return _ok()
         message_id = self._value(record.get("guid"), record.get("messageGuid"), record.get("id"))
         if message_id and self._inbound_dedup.contains(message_id):
@@ -619,6 +678,18 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         text = self._value(record.get("text"), record.get("message"), record.get("body")) or ""
         chat_guid, chat_identifier, sender = self._resolve_chat_and_sender(payload, record)
         is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
+        if event_type == "updated-message" and self._is_sparse_chat(
+                chat_guid, chat_identifier, sender, is_group):
+            extra_chats = await self._hydrate_chats(message_id)
+            if extra_chats:
+                record = {**record, "chats": extra_chats}
+                if any(";+;" in (c.get("guid") or "") for c in extra_chats):
+                    record["isGroup"] = True
+                chat_guid, chat_identifier, sender = self._resolve_chat_and_sender(payload, record)
+                is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
+            if self._is_sparse_chat(chat_guid, chat_identifier, sender, is_group):
+                logger.debug("[bluebubbles] ignoring sparse updated-message (no chat guid)")
+                return _ok()
         # Mention gate BEFORE the attachment downloads: an unmentioned group message must not
         # pull every attachment through the REST API only to be dropped.
         if is_group and self.require_mention:
@@ -635,8 +706,9 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             chat_guid, chat_identifier, sender, is_group) or sender
         if message_id:
             self._inbound_dedup.is_duplicate(message_id)
-        source = self.build_source(chat_id=session_chat_id, chat_name=chat_identifier or sender,
-                                   chat_type="group" if is_group else "dm", user_id=sender, user_name=sender,
+        speaker = self._speaker_label(sender, record)
+        source = self.build_source(chat_id=session_chat_id, chat_name=chat_identifier or speaker,
+                                   chat_type="group" if is_group else "dm", user_id=sender, user_name=speaker,
                                    chat_id_alt=chat_identifier)
         event = MessageEvent(
             text=text, message_type=msg_type, source=source, raw_message=payload,
