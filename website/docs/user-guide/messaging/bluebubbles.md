@@ -92,25 +92,6 @@ hermes gateway run
 
 Hermes will connect to your BlueBubbles server, register a webhook, and start listening for iMessage messages.
 
-The webhook Hermes registers is:
-
-```text
-http://localhost:8645/bluebubbles-webhook?password=<BLUEBUBBLES_PASSWORD>
-```
-
-(`BLUEBUBBLES_WEBHOOK_HOST` / `PORT` / `PATH` change the bind; default host `127.0.0.1` is advertised as `localhost`.) You do **not** normally paste this into the BlueBubbles UI — the adapter POSTs it to `/api/v1/webhook` on connect. Confirm in BlueBubbles → Settings → API → Webhooks that **one** Hermes URL is listed.
-
-Then verify the adapter actually started:
-
-```bash
-hermes config get platforms.bluebubbles.enabled   # must be true
-hermes logs gateway | grep bluebubbles
-```
-
-You want `connected to http://…`, `webhook listening on …`, and `webhook registered with server`. If you see `explicitly disabled by platforms.bluebubbles.enabled: false`, setup saved `.env` credentials but did **not** enable the platform — run `hermes config set platforms.bluebubbles.enabled true` and restart the gateway.
-
-`GET /api/v1/server/info` on the BlueBubbles API (`computer_id`, `detected_imessage`) is the Apple ID that will send. Two BlueBubbles apps on one Mac (two macOS users) are two Apple IDs and need **two API ports**. See [Multiple Users on the Same Mac](https://docs.bluebubbles.app/server/basic-guides/multiple-users-on-the-same-mac) (menu-bar Fast User Switching, do not log out the server user).
-
 ## How It Works
 
 ```
@@ -180,29 +161,9 @@ Without the Private API, basic text messaging and media still work.
 - Ensure network connectivity (firewall, port forwarding)
 
 ### Messages not arriving
-- Check that **exactly one** Hermes webhook is registered in BlueBubbles Server → Settings → API → Webhooks (`http://localhost:8645/bluebubbles-webhook?password=…`). Delete leftover hooks (dead ports, missing `http://`, events `*`).
-- A row in that list is not proof of delivery. Proof is `hermes logs gateway` showing `inbound message: platform=bluebubbles`.
-- If the message is in BlueBubbles (chat.db / API `message/count`) but Hermes has no inbound line, BlueBubbles is not POSTing or the send queue is wedged (see home-channel spam below).
-- `curl http://127.0.0.1:8645/health` should return `ok`. `localhost` vs IPv6 `::1` can fail if the listener is IPv4-only.
-
-### Setup saved credentials but nothing listens on 8645
-- `hermes gateway setup` writes `BLUEBUBBLES_SERVER_URL` / `BLUEBUBBLES_PASSWORD` only. It does not set `platforms.bluebubbles.enabled: true`.
-- If that key is `false` (for example Photon was the iMessage path), env credentials **do not** start the adapter. Set `platforms.bluebubbles.enabled: true` and restart.
-- Do not run Photon and BlueBubbles both enabled.
-
-### Wrong Apple ID / two BlueBubbles on one Mac
-- Hermes talks to whatever `BLUEBUBBLES_SERVER_URL` answers (`:1234` vs `:1235`). That process's Messages.app is the from-address (`detected_imessage` on `/api/v1/server/info`).
-- Give the second macOS user a **different API port**. Fast User Switch from the menu bar so that session stays logged in.
-- A stale Server URL in the BlueBubbles UI (old DHCP IP) is not what Hermes uses.
-
-### Two replies per iMessage
-- Gateway log shows the same text twice with `chat=any;-;+…` and `chat=+…` (two session keys). That is `new-message` plus `updated-message` (delivery/read) without chat-id canonicalization — see #30708 / #34372.
-- Also check you do not have two webhooks or Photon + BlueBubbles both on.
-
-### Home-channel recovered-reply spam / AppleScript -1743
-- `BLUEBUBBLES_HOME_CHANNEL` / `platforms.bluebubbles.home_channel` makes the gateway text that chat on restart. Failed AppleScript sends (`Not authorized to send Apple events to Messages. (-1743)`, 150s timeouts) retry as `♻️ Recovered reply` and can starve webhooks.
-- Leave home channel empty until a `method: private-api` send works on **that** BlueBubbles user. Use Telegram/etc. for home if needed.
-- Private API is required for reliable send when BlueBubbles runs in a background macOS user; AppleScript often does not.
+- Check that the webhook is registered in BlueBubbles Server → Settings → API → Webhooks
+- Verify the webhook URL is reachable from the Mac
+- Check `hermes logs gateway` for webhook errors (or `hermes logs -f` to follow in real-time)
 
 ### "Private API helper not connected"
 - Install the Private API helper: [docs.bluebubbles.app](https://docs.bluebubbles.app/helper-bundle/installation)
