@@ -63,7 +63,9 @@ _PAGINATION_SUFFIX_RE = re.compile(r"\s*\(\d+/\d+\)$")
 _ADDRESS_RE = re.compile(r"^\+\d+")
 
 _GUID_CACHE_SIZE = 500  # LRU cap for resolved chat-GUID lookups
+_SEEN_MESSAGE_IDS = 512  # inbound webhook GUID LRU — new-message + updated-message echo the same iMessage
 _LOCAL_HOSTS = {"0.0.0.0", "127.0.0.1", "localhost", "::"}
+_DM_GUID_SEP = ";-;"  # BlueBubbles 1:1 chat GUIDs: ``any;-;+1555…`` / ``iMessage;-;user@…``
 
 
 def _redact(text: str) -> str:
@@ -131,6 +133,7 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
         self._guid_cache: OrderedDict[str, str] = OrderedDict()
+        self._seen_message_ids: OrderedDict[str, None] = OrderedDict()
 
     # --- API helpers ---
 
@@ -545,8 +548,9 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     def _resolve_chat_and_sender(self, payload: Dict[str, Any], record: Dict[str, Any]):
         """Returns ``(chat_guid, chat_identifier, sender)`` from the many BlueBubbles payload shapes."""
         chat_guid = self._value(record.get("chatGuid"), payload.get("chatGuid"), record.get("chat_guid"),
-                                payload.get("chat_guid"), payload.get("guid"))
+                                payload.get("chat_guid"))
         # BlueBubbles v1.9+ payloads omit top-level chatGuid; it's nested under data.chats[0].guid.
+        # Do NOT fall back to payload/record ``guid`` — that is the *message* GUID.
         _chats = record.get("chats") or []
         if not chat_guid and _chats and isinstance(_chats[0], dict):
             chat_guid = _chats[0].get("guid") or _chats[0].get("chatGuid")
@@ -558,6 +562,36 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if not (chat_guid or chat_identifier) and sender:
             chat_identifier = sender
         return chat_guid, chat_identifier, sender
+
+    @staticmethod
+    def _canonical_session_chat_id(chat_guid: Optional[str], chat_identifier: Optional[str],
+                                   sender: Optional[str], is_group: bool) -> Optional[str]:
+        """Collapse BlueBubbles DM chat-id variants onto one session key.
+
+        ``new-message`` often carries ``chats[0].guid`` like ``any;-;+1555…`` while the paired
+        ``updated-message`` (delivery/read) carries only the bare handle. Those used to become
+        two gateway sessions and two replies (#30708 / #34372).
+        """
+        if is_group:
+            return chat_guid or chat_identifier or sender
+        for cand in (chat_identifier, sender):
+            if cand and _DM_GUID_SEP not in cand and ";+;" not in cand:
+                return cand
+        if chat_guid and _DM_GUID_SEP in chat_guid:
+            return chat_guid.split(_DM_GUID_SEP, 1)[-1]
+        return chat_guid or chat_identifier or sender
+
+    def _remember_message_id(self, message_id: Optional[str]) -> bool:
+        """True if this message GUID was already dispatched. Records new ids (bounded LRU)."""
+        if not message_id:
+            return False
+        if message_id in self._seen_message_ids:
+            self._seen_message_ids.move_to_end(message_id)
+            return True
+        self._seen_message_ids[message_id] = None
+        while len(self._seen_message_ids) > _SEEN_MESSAGE_IDS:
+            self._seen_message_ids.popitem(last=False)
+        return False
 
     async def _handle_webhook(self, request):
         from aiohttp import web
@@ -578,9 +612,15 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         assoc_type = record.get("associatedMessageType")
         if isinstance(assoc_type, int) and assoc_type in _TAPBACK_CODES:  # tapback reactions delivered as messages
             return _ok()
+        # Read/delivered receipts are ``updated-message`` with the original text; they are not new turns.
+        if event_type == "updated-message" and (record.get("dateRead") or record.get("dateDelivered")):
+            return _ok()
+        message_id = self._value(record.get("guid"), record.get("messageGuid"), record.get("id"))
+        if message_id and message_id in self._seen_message_ids:
+            self._seen_message_ids.move_to_end(message_id)
+            return _ok()
         text = self._value(record.get("text"), record.get("message"), record.get("body")) or ""
         chat_guid, chat_identifier, sender = self._resolve_chat_and_sender(payload, record)
-        session_chat_id = chat_guid or chat_identifier
         is_group = bool(record.get("isGroup")) or (";+;" in (chat_guid or ""))
         # Mention gate BEFORE the attachment downloads: an unmentioned group message must not
         # pull every attachment through the REST API only to be dropped.
@@ -594,12 +634,16 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             text = "(attachment)"
         if not sender or not (chat_guid or chat_identifier) or not text:
             return web.json_response({"error": "missing message fields"}, status=400)
+        session_chat_id = self._canonical_session_chat_id(
+            chat_guid, chat_identifier, sender, is_group) or sender
+        if message_id:
+            self._remember_message_id(message_id)
         source = self.build_source(chat_id=session_chat_id, chat_name=chat_identifier or sender,
                                    chat_type="group" if is_group else "dm", user_id=sender, user_name=sender,
                                    chat_id_alt=chat_identifier)
         event = MessageEvent(
             text=text, message_type=msg_type, source=source, raw_message=payload,
-            message_id=self._value(record.get("guid"), record.get("messageGuid"), record.get("id")),
+            message_id=message_id,
             reply_to_message_id=self._value(record.get("threadOriginatorGuid"), record.get("associatedMessageGuid")),
             media_urls=media_urls, media_types=media_types)
         task = asyncio.create_task(self.handle_message(event))

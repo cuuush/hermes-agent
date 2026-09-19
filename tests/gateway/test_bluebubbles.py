@@ -606,3 +606,105 @@ class TestBlueBubblesGateBeforeDownload:
         assert response.status == 200
         assert download.await_count == downloads
         assert len(handled) == handled_count
+
+
+class TestBlueBubblesDuplicateInbound:
+    """new-message + updated-message must not become two DM sessions / two agent turns (#30708)."""
+
+    @pytest.mark.parametrize(
+        "chat_guid, identifier, sender, is_group, expected",
+        [
+            ("any;-;+15555550100", None, "+15555550100", False, "+15555550100"),
+            (None, "+15555550100", "+15555550100", False, "+15555550100"),
+            ("iMessage;-;user@example.com", "user@example.com", "user@example.com", False, "user@example.com"),
+            ("iMessage;+;chat-group", None, "+15555550100", True, "iMessage;+;chat-group"),
+        ],
+    )
+    def test_canonical_session_chat_id_collapses_dm_variants(
+            self, monkeypatch, chat_guid, identifier, sender, is_group, expected):
+        from gateway.platforms.bluebubbles import BlueBubblesAdapter
+        _make_adapter(monkeypatch)
+        assert BlueBubblesAdapter._canonical_session_chat_id(
+            chat_guid, identifier, sender, is_group) == expected
+
+    @pytest.mark.asyncio
+    async def test_guid_and_bare_handle_events_share_one_session(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event.source.chat_id)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        first = await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "new-message",
+            "data": {
+                "guid": "msg-dup-1",
+                "text": "Hi",
+                "handle": {"address": "+15555550100"},
+                "isFromMe": False,
+                "chats": [{"guid": "any;-;+15555550100"}],
+            },
+        }))
+        second = await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "updated-message",
+            "data": {
+                "guid": "msg-dup-1",
+                "text": "Hi",
+                "handle": {"address": "+15555550100"},
+                "isFromMe": False,
+                "chatIdentifier": "+15555550100",
+            },
+        }))
+        await asyncio.sleep(0)
+        assert first.status == 200
+        assert second.status == 200
+        assert handled == ["+15555550100"]
+
+    @pytest.mark.asyncio
+    async def test_receipt_updated_message_is_not_a_turn(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        response = await adapter._handle_webhook(_FakeBlueBubblesRequest({
+            "type": "updated-message",
+            "data": {
+                "guid": "msg-receipt-1",
+                "text": "Hi",
+                "handle": {"address": "+15555550100"},
+                "isFromMe": False,
+                "dateRead": 1789849814879,
+                "chats": [{"guid": "any;-;+15555550100"}],
+            },
+        }))
+        await asyncio.sleep(0)
+        assert response.status == 200
+        assert handled == []
+
+    @pytest.mark.asyncio
+    async def test_distinct_message_guids_still_dispatch(self, monkeypatch):
+        adapter = _make_adapter(monkeypatch, send_read_receipts=False)
+        handled = []
+
+        async def fake_handle_message(event):
+            handled.append(event.message_id)
+
+        monkeypatch.setattr(adapter, "handle_message", fake_handle_message)
+        for guid in ("msg-a", "msg-b"):
+            await adapter._handle_webhook(_FakeBlueBubblesRequest({
+                "type": "new-message",
+                "data": {
+                    "guid": guid,
+                    "text": guid,
+                    "handle": {"address": "+15555550100"},
+                    "isFromMe": False,
+                    "chats": [{"guid": "any;-;+15555550100"}],
+                },
+            }))
+        await asyncio.sleep(0)
+        assert handled == ["msg-a", "msg-b"]
+
