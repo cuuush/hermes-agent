@@ -96,9 +96,11 @@ class SessionRecoveryMixin:
     def _generate_session_key(self, source: SessionSource, key_source: Optional[SessionSource] = None) -> str:
         """Session key for *source* (profile from *source*; key from *key_source* if given)."""
         from gateway.session import build_session_key
+        from gateway.session import group_sessions_per_user_for
+        key_src = key_source if key_source is not None else source
         return build_session_key(
-            key_source if key_source is not None else source,
-            group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
+            key_src,
+            group_sessions_per_user=group_sessions_per_user_for(self.config, key_src),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False),
             profile=self._resolve_profile_for_key(source))
 

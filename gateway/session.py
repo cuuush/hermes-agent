@@ -339,15 +339,27 @@ def _discord_platform_notes(context: SessionContext) -> List[str]:
     return lines
 
 
-_STATIC_PLATFORM_NOTES = {
-    Platform.BLUEBUBBLES: (
+def _bluebubbles_platform_notes(context: SessionContext) -> List[str]:
+    src = context.source
+    lines = ["", (
         "**Platform notes:** You are responding via iMessage. Keep responses short and "
         "conversational — think texts, not essays. Structure longer replies as separate short "
         "thoughts, each separated by a blank line (double newline). Each block between blank lines "
         "will be delivered as its own iMessage bubble, so write accordingly: one idea per bubble, "
         "1–3 sentences each. If the user needs a detailed answer, give the short version first and "
         "offer to elaborate."
-    ),
+    )]
+    if src.chat_type == "group":
+        lines.append(
+            "**This is an iMessage group chat.** Your replies are visible to everyone in the "
+            "thread — do not treat it as a 1:1 DM. Incoming messages are prefixed with [sender]. "
+            "A line like `Loved \"…\"` or `Emphasized \"…\"` is a tapback from that sender, not a "
+            "new request."
+        )
+    return lines
+
+
+_STATIC_PLATFORM_NOTES = {
     Platform.YUANBAO: (
         "**Platform notes:** You are running inside Yuanbao. To send a private (DM) message to a "
         "user in the current group, use the yb_send_dm tool (look up the recipient by name or pass "
@@ -359,6 +371,7 @@ _STATIC_PLATFORM_NOTES = {
 _PLATFORM_NOTES = {
     Platform.SLACK: _slack_platform_notes,
     Platform.DISCORD: _discord_platform_notes,
+    Platform.BLUEBUBBLES: _bluebubbles_platform_notes,
     **{p: (lambda ctx, note=note: ["", note]) for p, note in _STATIC_PLATFORM_NOTES.items()},
 }
 
@@ -383,6 +396,8 @@ def build_session_context_prompt(context: SessionContext, *, redact_pii: bool = 
     platform_name = src.platform.value.title()
     if src.platform == Platform.LOCAL:
         lines.append(f"**Source:** {platform_name} (the machine running this agent)")
+    elif src.platform == Platform.BLUEBUBBLES and src.chat_type == "group":
+        lines.append("**Source:** iMessage group chat (BlueBubbles)")
     else:
         desc = src.description
         if redact_pii:
@@ -619,6 +634,25 @@ def build_channel_continuity_note(entry: "SessionEntry", source: SessionSource) 
         f"{where}'s history, use the session_search tool to recall that prior session before "
         f"acting — do not assume an unrelated recent session is the right context.]"
     )
+
+
+def group_sessions_per_user_for(config, source: "SessionSource") -> bool:
+    """Platform ``extra.group_sessions_per_user`` overrides the global flag.
+
+    iMessage group chats often need one shared room (``false``) while Telegram
+    can keep the default per-sender isolation.
+    """
+    default = bool(getattr(config, "group_sessions_per_user", True)) if config is not None else True
+    plat = getattr(source, "platform", None)
+    platforms = getattr(config, "platforms", None) or {}
+    pc = platforms.get(plat) if plat is not None else None
+    extra = getattr(pc, "extra", None) or {}
+    if "group_sessions_per_user" not in extra:
+        return default
+    val = extra["group_sessions_per_user"]
+    if isinstance(val, str):
+        return val.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(val)
 
 
 def is_shared_multi_user_session(
@@ -1269,7 +1303,7 @@ def build_session_context(
     """Build a full session context (for system prompt injection)."""
     connected = config.get_connected_platforms()
     shared = is_shared_multi_user_session(
-        source, group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
+        source, group_sessions_per_user=group_sessions_per_user_for(config, source),
         thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
     )
     context = SessionContext(

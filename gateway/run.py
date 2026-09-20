@@ -3815,8 +3815,9 @@ class GatewayRunner(
                     _profile = get_active_profile_name() or "default"
                 except Exception:
                     _profile = None
+        from gateway.session import group_sessions_per_user_for
         return build_session_key(
-            source, group_sessions_per_user=getattr(config, "group_sessions_per_user", True),
+            source, group_sessions_per_user=group_sessions_per_user_for(config, source),
             thread_sessions_per_user=getattr(config, "thread_sessions_per_user", False),
             profile=_profile)
 

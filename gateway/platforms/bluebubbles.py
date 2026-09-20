@@ -24,7 +24,7 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.event import MessageEvent, MessageType
 from .media_cache import ext_for_mime
-from gateway.platforms.helpers import compile_mention_patterns, strip_markdown
+from gateway.platforms.helpers import MessageDeduplicator, compile_mention_patterns, strip_markdown
 from utils import TRUTHY_STRINGS
 
 # Historical BlueBubbles mime→ext maps, preserved verbatim as overrides for the shared dispatch in
@@ -55,7 +55,9 @@ DEFAULT_MENTION_PATTERNS = [r"(?<![\w@])@?hermes\s+agent\b[,:\-]?", r"(?<![\w@])
 
 # Tapback associatedMessageType codes: 2000-2005 added, 3000-3005 removed (love, like, dislike, ...).
 _TAPBACK_CODES = {*range(2000, 2006), *range(3000, 3006)}
-_MESSAGE_EVENTS = {"new-message", "message", "updated-message"}  # webhook event types carrying user messages
+# Other people in a group often only fire updated-message; receipts reuse that type with a sparse chat id.
+_MESSAGE_EVENTS = {"new-message", "message", "updated-message"}
+_WEBHOOK_EVENTS = ("new-message", "updated-message")
 
 _PHONE_RE = re.compile(r"\+?\d{7,15}")
 _EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+")
@@ -64,6 +66,7 @@ _ADDRESS_RE = re.compile(r"^\+\d+")
 
 _GUID_CACHE_SIZE = 500  # LRU cap for resolved chat-GUID lookups
 _LOCAL_HOSTS = {"0.0.0.0", "127.0.0.1", "localhost", "::"}
+_DM_GUID_SEP = ";-;"
 
 
 def _redact(text: str) -> str:
@@ -131,6 +134,8 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         self._private_api_enabled: Optional[bool] = None
         self._helper_connected: bool = False
         self._guid_cache: OrderedDict[str, str] = OrderedDict()
+        self._speaker_name_cache: OrderedDict[str, str] = OrderedDict()
+        self._inbound_dedup = MessageDeduplicator(max_size=2000, ttl_seconds=300)
 
     # --- API helpers ---
 
@@ -282,17 +287,30 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         return []
 
     async def _register_webhook(self) -> bool:
-        """Register this webhook URL, reusing an existing registration if present (crash resilience —
-        avoids duplicates after an unclean shutdown)."""
+        """Register this webhook for ``new-message`` + ``updated-message``. Deletes every same-URL
+        row whose event set does not match."""
         if not self.client:
             return False
         webhook_url, log_url = self._webhook_register_url, self._webhook_register_url_for_log
-        if await self._find_registered_webhooks(webhook_url):
+        existing = await self._find_registered_webhooks(webhook_url)
+        keep = None
+        desired = set(_WEBHOOK_EVENTS)
+        for wh in existing:
+            events = set(wh.get("events") or [])
+            if keep is None and events == desired and wh.get("id"):
+                keep = wh
+                continue
+            if wh_id := wh.get("id"):
+                try:
+                    (await self.client.delete(self._api_url(f"/api/v1/webhook/{wh_id}"))).raise_for_status()
+                except Exception as exc:
+                    logger.warning("[bluebubbles] failed to delete stale webhook %s: %s", wh_id, exc)
+                    return False
+        if keep:
             logger.info("[bluebubbles] webhook already registered: %s", log_url)
             return True
         try:
-            res = await self._api_post("/api/v1/webhook",
-                                       {"url": webhook_url, "events": ["new-message", "updated-message"]})
+            res = await self._api_post("/api/v1/webhook", {"url": webhook_url, "events": list(_WEBHOOK_EVENTS)})
             status = res.get("status", 0)
             if 200 <= status < 300:
                 logger.info("[bluebubbles] webhook registered with server: %s", log_url)
@@ -545,8 +563,9 @@ class BlueBubblesAdapter(BasePlatformAdapter):
     def _resolve_chat_and_sender(self, payload: Dict[str, Any], record: Dict[str, Any]):
         """Returns ``(chat_guid, chat_identifier, sender)`` from the many BlueBubbles payload shapes."""
         chat_guid = self._value(record.get("chatGuid"), payload.get("chatGuid"), record.get("chat_guid"),
-                                payload.get("chat_guid"), payload.get("guid"))
+                                payload.get("chat_guid"))
         # BlueBubbles v1.9+ payloads omit top-level chatGuid; it's nested under data.chats[0].guid.
+        # Do NOT fall back to payload/record ``guid`` — that is the *message* GUID.
         _chats = record.get("chats") or []
         if not chat_guid and _chats and isinstance(_chats[0], dict):
             chat_guid = _chats[0].get("guid") or _chats[0].get("chatGuid")
@@ -558,6 +577,54 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if not (chat_guid or chat_identifier) and sender:
             chat_identifier = sender
         return chat_guid, chat_identifier, sender
+
+    @staticmethod
+    def _is_sparse_chat(chat_guid: Optional[str], chat_identifier: Optional[str],
+                        sender: Optional[str], is_group: bool) -> bool:
+        if is_group:
+            return False
+        if chat_guid and (_DM_GUID_SEP in chat_guid or ";+;" in chat_guid):
+            return False
+        return True
+
+    async def _hydrate_chats(self, message_id: Optional[str]) -> list:
+        if not message_id or not self.client:
+            return []
+        with suppress(Exception):
+            data = (await self._api_get(f"/api/v1/message/{quote(message_id, safe='')}")) .get("data")
+            if isinstance(data, dict):
+                chats = data.get("chats") or []
+                if isinstance(chats, list):
+                    return [c for c in chats if isinstance(c, dict)]
+        return []
+
+    def _speaker_label(self, address: Optional[str], record: Optional[Dict[str, Any]] = None) -> str:
+        """Human name for [sender] prefixes. Cached. Never invent a name from the phone digits."""
+        addr = (address or "").strip()
+        if not addr:
+            return "someone"
+        if addr in self._speaker_name_cache:
+            return self._speaker_name_cache[addr]
+        name = ""
+        handle = (record or {}).get("handle") if record else None
+        if isinstance(handle, dict):
+            name = str(handle.get("firstName") or handle.get("displayName") or handle.get("name") or "").strip()
+        if not name or name == addr:
+            with suppress(Exception):
+                from gateway.pairing import PairingStore
+                for user in PairingStore().list_approved("bluebubbles"):
+                    if str(user.get("user_id") or "") != addr:
+                        continue
+                    candidate = str(user.get("user_name") or "").strip()
+                    if candidate and candidate != addr and not candidate.startswith("+"):
+                        name = candidate
+                    break
+        if not name or name == addr or name.startswith("+"):
+            name = addr
+        if len(self._speaker_name_cache) > 200:
+            self._speaker_name_cache.popitem(last=False)
+        self._speaker_name_cache[addr] = name
+        return name
 
     async def _handle_webhook(self, request):
         from aiohttp import web
@@ -594,8 +661,9 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             text = "(attachment)"
         if not sender or not (chat_guid or chat_identifier) or not text:
             return web.json_response({"error": "missing message fields"}, status=400)
-        source = self.build_source(chat_id=session_chat_id, chat_name=chat_identifier or sender,
-                                   chat_type="group" if is_group else "dm", user_id=sender, user_name=sender,
+        speaker = self._speaker_label(sender, record)
+        source = self.build_source(chat_id=session_chat_id, chat_name=chat_identifier or speaker,
+                                   chat_type="group" if is_group else "dm", user_id=sender, user_name=speaker,
                                    chat_id_alt=chat_identifier)
         event = MessageEvent(
             text=text, message_type=msg_type, source=source, raw_message=payload,
